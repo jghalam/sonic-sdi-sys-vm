@@ -1,0 +1,3 @@
+etc/sonic/sdi/*.sql
+usr/lib/*/*.so.*
+usr/bin/*.sh

@@ -1,0 +1,1524 @@
+#!/usr/bin/python
+# Copyright (c) 2016 Dell Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+#
+# THIS CODE IS PROVIDED ON AN  *AS IS* BASIS, WITHOUT WARRANTIES OR
+# CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT
+# LIMITATION (ANY IMPLIED WARRANTIES OR CONDITIONS OF TITLE, FITNESS
+# FOR A PARTICULAR PURPOSE, MERCHANTABLITY OR NON-INFRINGEMENT.
+#
+# See the Apache Version 2.0 License for specific language governing
+# permissions and limitations under the License.
+
+import sys
+import sqlite3
+import time
+import os
+
+# Constants
+SDI_DB_BASE_DEFAULT   = '/etc/opt/dell/os10/sdi/'
+SDI_DB_NAME_DEFAULT   = 'vm.db'
+SDI_DB_QUERY_ALL      = ''                      # No condition filtering
+
+# SDI DB table identifiers
+TABLE_THERMAL_SENSOR    = 'Thermal'             # Thermal sensor table
+TABLE_FAN               = 'Fan'                 # Fan table
+TABLE_INFO              = 'Entity_Info'         # Entity information
+TABLE_MEDIA             = 'Media'               # Media devices
+TABLE_RESOURCES         = 'Entity_Resource'     # Global resource list
+TABLE_MEDIA_PARAMS      = 'Media_Parameters'    # Media parameters table
+TABLE_MEDIA_VENDOR_INFO = 'Media_Vendor_Info'   # Media vendor info table
+
+# SDI TABLE_INFO DB fields
+INFO_ENTITY_NAME        = 'Entity_Name'         # Entity Name
+INFO_PRESENCE           = 'Presence'            # Entity Info Presence flag
+INFO_NUM_FANS           = 'Num_Fans'            # Entity Info num fans
+INFO_FAULT              = 'Fault_Status'        # Entity Info Fault flag
+
+# SDI TABLE_INFO DB, field TBL_ENTITY_TYPE
+TBL_INFO_TYPE_FAN_MEDIA = 1                     # Resource Type of Fan Media
+TBL_INFO_TYPE_PSU_MEDIA = 2                     # Resource Type of PSU Media
+
+# SDI TABLE_RESOURCES DB fields 
+TBL_ENTITY_HDL          = 'Entity_Handle'       # Entity Handle
+TBL_RESOURCE_HDL        = 'Resource_Handle'     # Resource Handle
+TBL_ENTITY_TYPE         = 'Entity_Type'         # Entity Type
+TBL_ENTITY_INSTANCE     = 'Instance'            # Entity Instance
+TBL_RESOURCE_TYPE       = 'Resource_Type'       # Resource Type
+TBL_RESOURCE_INSTANCE   = 'Instance'            # Resource Instance
+TBL_RESOURCE_ALIAS      = 'Alias'               # Resource Alias
+
+# SDI TABLE_RESOURCES DB, field TBL_RESOURCE_TYPE
+TBL_RESOURCE_TYPE_THERM_MEDIA = 0               # Resource Type of Thermal Sensor Media
+TBL_RESOURCE_TYPE_OPTICS_MEDIA = 6              # Resource Type of Optics Media
+
+# SDI TABLE_MEDIA DB fields
+MEDIA_DELL_QUALIFIED    = 'DELL_Qualified'      # Dell qualified
+MEDIA_PRESENCE          = 'Present'             # Media presence
+MEDIA_VENDOR_OUI        = 'Vendor_OUI'          # Media OUI
+MEDIA_OPTIC_SPEED       = 'Optic_Speed'         # Optics speed
+MEDIA_DELL_PROD_INFO    = 'DELL_Product_Info'   # Dell product info
+MEDIA_SUPPORTED_FEATURES = 'Media_Supported_Features' # Media supported features
+MEDIA_TRANSCEIVER_CODE  = 'XCVR_Code'           # Media transceiver code
+MEDIA_LP_MODE           = 'Low_Power_Mode'      # Media low power mode
+MEDIA_RESET             = 'Reset'               # Media reset
+
+# SDI TABLE MEDIA DB, field MEDIA_DELL_PROD_INFO
+PLAT_SDI_SFP_PLUS_MODE_1   = 3                  # SDI Media Identifier, SFP+
+PLAT_SDI_SFP_PLUS_MODE_2   = 11                 # SDI Media Identifier, SFP+
+PLAT_SDI_QSFP_MODE         = 12                 # SDI Media Identifier, QSFP
+PLAT_SDI_QSFP_PLUS_MODE    = 13                 # SDI Media Identifier, QSFP+
+
+# SDI TABLE_MEDIA_PARAMS DB fields (Parameter, Value) pairs
+MEDIA_PARAM_TYPE        = 'Parameter'           # Media parameter type
+MEDIA_PARAM_VALUE       = 'Value'               # Media parameter value
+
+# SDI TABLE_MEDIA_PARAMS DB, field MEDIA_PARAM_TYPE pair
+SDI_MEDIA_WAVELENGTH    = 0                     # SDI MEDIA Nominal laser wavelength
+SDI_MEDIA_IDENTIFIER    = 8                     # SDI MEDIA Identifier Type of serial Module
+SDI_MEDIA_LENGTH_CABLE_ASSEMBLY = 14            # SDI MEDIA length support for copper or
+                                                #  direct attach cable
+SDI_MEDIA_DEVICE_TECH   = 19                    # SDI MEDIA Transmitter/Device Technology
+
+# SDI TABLE_MEDIA_VENDOR_INFO DB, fields (Vendor_Info, Value) pairs
+MEDIA_VENDOR_INFO_TYPE  = 'Vendor_Info'         # Media vendor info type
+MEDIA_VENDOR_INFO_VALUE = 'Value'               # Media vendor info value
+
+# SDI TABLE_MEDIA_VENDOR DB, field MEDIA_VENDOR_INFO_TYPE pair
+SDI_MEDIA_VENDOR_PN     = 4                     # Media vendor part number
+
+# SDI TABLE_FAN DB, fields
+FAN_FAULT               = 'Alert_On'            # Fan Fault
+
+# SDI TABLE_THERMAL_SENSOR DB, fields
+THERMAL_TEMPERATURE        = 'Temp_C'           # Thermal temperature value
+THERMAL_FAULT              = 'Alert_On'         # Thermal Sensor Fault
+THERMAL_THRESHOLD_LOW      = 'Threshold_Low'    # Low Threshold
+THERMAL_THRESHOLD_HIGH     = 'Threshold_High'   # High Threshold
+THERMAL_THRESHOLD_CRITICAL = 'Threshold_Critical' # Critical Threshold
+
+PLAT_MEDIA_FANTRAY_STR  = 'Fantray'             # Fantray string
+PLAT_MEDIA_PSU_STR      = 'PSU'                 # PSU string
+
+PLAT_MEDIA_NOT_PRESENT = 0                      # Media not present value
+PLAT_MEDIA_PRESENT     = 1                      # Media present value
+PLAT_MEDIA_ERROR       = 0xFFFFFFFF             # Media error value
+
+PLAT_MEDIA_NO_FAULT    = 0                      # Media no fault value
+PLAT_MEDIA_FAULT       = 1                      # Media fault value
+
+PLAT_THERMAL_MIN_TEMP  = 0                      # Thermal min temp input
+PLAT_THERMAL_MAX_TEMP  = 255                    # Thermal max temp input
+
+
+# Help string for platform
+HELP_STRING_PLATFORM_EVENT = '\n\
+  Enter PlatCmd: [-h|-q|#]\n\
+    -h    Help\n\
+    -q    Quit\n\
+     #    Event to generate\n\
+          1 = Optics\n\
+          2 = Fantray\n\
+          3 = PSU\n\
+          4 = Thermal Sensors\n'
+
+# Help string for optics
+HELP_STRING_OPTICS_EVENT = '\n\
+  Enter OpticsCmd: [-h|-q|-e|#]\n\
+    -h    Help\n\
+    -q    Quit\n\
+    -e    Exit\n\
+     #    Optics event to generate\n\
+          1 = Insert port optics\n\
+          2 = Remove port optics\n\
+          3 = Insert same port optics (optics presence)\n'
+
+# Help string for optics presence
+HELP_STRING_OPTICS_PRESENCE_EVENT = '\n\
+  Enter OpticsPort%s: [-q|-e|#]\n\
+    -q    Quit\n\
+    -e    Exit\n\
+     #    Port [1..%d]\n'
+
+# Help string for optics insert
+HELP_STRING_OPTICS_INSERT_EVENT = '\n\
+  Enter opticsPortIns: [-h|-q|-e|-m|#]\n\
+    -h    Help\n\
+    -q    Quit\n\
+    -e    Exit\n\
+    -m    Mode QSFP/QSFP-PLUS (%s)\n\
+     #    Port [1..%d]\n\
+          Optics Type [1..%d]    Default: 36  QSFP_40GBASE_CR4_1M\n'
+
+# Help string for fantray
+HELP_STRING_MEDIA_EVENT = '\n\
+  Enter %sCmd: [-h|-q|-e|#]\n\
+    -h    Help\n\
+    -q    Quit\n\
+    -e    Exit\n\
+     #    Event to generate\n\
+          1 = Insert %s\n\
+          2 = Remove %s\n\
+          3 = Insert %s fault\n\
+          4 = Clear  %s fault\n\
+          5 = Insert %s fan fault\n\
+          6 = Clear  %s fan fault\n'
+
+# Help string for entity media state
+HELP_STRING_MEDIA_STATE_EVENT = '\n\
+  Enter %s%s: [-q|-e|#]\n\
+    -q    Quit\n\
+    -e    Exit\n\
+     #    %s [1..%d]\n'
+
+# Help string for entity media fault
+HELP_STRING_MEDIA_FAULT_EVENT = '\n\
+  Enter %sFlt%s: [-q|-e|#]\n\
+    -q    Quit\n\
+    -e    Exit\n\
+     #    %s [1..%d]\n'
+
+# Help string for entity fan fault
+HELP_STRING_MEDIA_FAN_FAULT_EVENT = '\n\
+  Enter %sFanFlt%s: [-q|-e|#]\n\
+    -q    Quit\n\
+    -e    Exit\n\
+     #    %s [1..%d]\n\
+          Fan [1..%d]\n'
+
+# Help string for thermal
+HELP_STRING_THERMAL_EVENT = '\n\
+  Enter ThermalCmd: [-h|-q|-e|#]\n\
+    -h    Help\n\
+    -q    Quit\n\
+    -e    Exit\n\
+     #    Thermal event to generate\n\
+          1 = Insert fault\n\
+          2 = Clear fault\n\
+          3 = Set temp\n\
+          4 = List sensors & temps\n'
+
+# Help string for thermal fault 
+HELP_STRING_THERMAL_FAULT_EVENT = '\n\
+  Enter ThermalFlt%s: [-q|-e|#]\n\
+    -q    Quit\n\
+    -e    Exit\n\
+     #    Sensor [1..%d]'
+
+# Help string for thermal temp
+HELP_STRING_THERMAL_TEMP_EVENT = '\n\
+  Enter ThermalSensor: [-q|-e|#]\n\
+    -q    Quit\n\
+    -e    Exit\n\
+     #    Sensor [1..%d]\n\
+          Temp [%d..%d]           Default: 20'
+
+# Optics SDI Identifier to names
+SDI_IDENT = {
+  PLAT_SDI_SFP_PLUS_MODE_1: {'name': 'SFP-PLUS'},
+  PLAT_SDI_SFP_PLUS_MODE_2: {'name': 'SFP-PLUS'},
+  PLAT_SDI_QSFP_MODE:       {'name': 'QSFP'},
+  PLAT_SDI_QSFP_PLUS_MODE:  {'name': 'QSFP-PLUS'}
+}
+
+# Optics table
+#   Default values are from sql init file
+OPTICS_TABLE = {
+   # SFP_PLUS - type based on sdi and pInfo
+   1: { 'name': 'SFPPLUS_10GBASE_USR', 'sdi': 3,\
+        'pInfo': "x'0F1000931F4000'", 'tCode': "x'2000000700000000'",\
+        'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   2: { 'name': 'SFPPLUS_10GBASE_SR (wvL 1)', 'sdi': 3,\
+        'pInfo': "x'0F100013FF4000'", 'tCode': "x'2000000700000000'",\
+        'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   3: { 'name': 'SFPPLUS_10GBASE_SR (wvL 11)', 'sdi': 3,\
+        'pInfo': "x'0F1000B3FF4000'", 'tCode': "x'2000000700000000'",\
+        'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   4: { 'name': 'SFPPLUS_10GBASE_LR', 'sdi': 3,\
+        'pInfo': "x'0F100023FF4000'", 'tCode': "x'2000000700000000'",\
+        'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   5: { 'name': 'SFPPLUS_10GBASE_ER', 'sdi': 3,\
+        'pInfo': "x'0F1000334F4000'", 'tCode': "x'2000000700000000'",\
+        'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   6: { 'name': 'SFPPLUS_10GBASE_ZR', 'sdi': 3,\
+        'pInfo': "x'0F1000335F4000'", 'tCode': "x'2000000700000000'",\
+        'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   7: { 'name': 'SFPPLUS_10GBASE_CX4', 'sdi': 3,\
+        'pInfo': "x'0F100043FF4000'", 'tCode': "x'2000000700000000'",\
+        'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   8: { 'name': 'SFPPLUS_10GBASE_LRM', 'sdi': 3,\
+        'pInfo': "x'0F100063FF4000'", 'tCode': "x'2000000700000000'",\
+        'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   9: { 'name': 'SFPPLUS_10GBASE_T', 'sdi': 3,\
+        'pInfo': "x'0F100053FF4000'", 'tCode': "x'2000000700000000'",\
+        'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   10: { 'name': 'SFPPLUS_10GBASE_CU1M', 'sdi': 11,\
+         'pInfo': "x'0F1000A36F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   11: { 'name': 'SFPPLUS_10GBASE_CU2M', 'sdi': 11,\
+         'pInfo': "x'0F1000A3CF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   12: { 'name': 'SFPPLUS_10GBASE_CU3M', 'sdi': 11,\
+         'pInfo': "x'0F1000A37F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   13: { 'name': 'SFPPLUS_10GBASE_CU5M', 'sdi': 11,\
+         'pInfo': "x'0F1000A38F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   14: { 'name': 'SFPPLUS_10GBASE_CU7M', 'sdi': 11,\
+         'pInfo': "x'0F1000A3DF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   15: { 'name': 'SFPPLUS_10GBASE_CU10M', 'sdi': 11,\
+         'pInfo': "x'0F1000A39F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   16: { 'name': 'SFPPLUS_10GBASE_CUHALFM', 'sdi': 11,\
+         'pInfo': "x'0F1000A3BF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   17: { 'name': 'SFPPLUS_10GBASE_ACU10M', 'sdi': 11,\
+         'pInfo': "x'0F1000C39F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   18: { 'name': 'SFPPLUS_10GBASE_ACU15M', 'sdi': 11,\
+         'pInfo': "x'0F1000C3AF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   19: { 'name': 'SFPPLUS_10GBASE_DWDM', 'sdi': 11,\
+         'pInfo': "x'0F100073FF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+
+   # QSFP/QSFP_PLUS - type based on sdi and pInfo
+   20: { 'name': 'QSFP_40GBASE_SR4', 'sdi': 12,\
+         'pInfo': "x'0F100013FF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   21: { 'name': 'QSFP_40GBASE_SR4 (wvL 10,dst 5)', 'sdi': 12,\
+         'pInfo': "x'0F1000A35F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   22: { 'name': 'QSFP_40GBASE_SR4 (wvL 10,dst 8)', 'sdi': 12,\
+         'pInfo': "x'0F1000A38F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   23: { 'name': 'QSFP_40GBASE_SR4_EXT', 'sdi': 12,\
+         'pInfo': "x'0F1000C3FF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   24: { 'name': 'QSFP_40GBASE_LR4 (wvL 2,dst 1)', 'sdi': 12,\
+         'pInfo': "x'0F1000231F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   25: { 'name': 'QSFP_40GBASE_LR4 (wvL 2,dst 2)', 'sdi': 12,\
+         'pInfo': "x'0F1000232F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   26: { 'name': 'QSFP_40GBASE_LR4 (wvL 3,dst 3)', 'sdi': 12,\
+         'pInfo': "x'0F1000333F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   27: { 'name': 'QSFP_40GBASE_LM4', 'sdi': 12,\
+         'pInfo': "x'0F100043FF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   28: { 'name': 'QSFP_40GBASE_PSM4_LR', 'sdi': 12,\
+         'pInfo': "x'0F100053FF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   29: { 'name': 'QSFP_40GBASE_PSM4_1490NM', 'sdi': 12,\
+         'pInfo': "x'0F1000D3FF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   30: { 'name': 'QSFP_40GBASE_PSM4_1490NM_1M', 'sdi': 12,\
+         'pInfo': "x'0F1000D32F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   31: { 'name': 'QSFP_40GBASE_PSM4_1490NM_3M', 'sdi': 12,\
+         'pInfo': "x'0F1000D33F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   32: { 'name': 'QSFP_40GBASE_PSM4_1490NM_5M', 'sdi': 12,\
+         'pInfo': "x'0F1000D34F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   33: { 'name': 'QSFP_40GBASE_SM4', 'sdi': 12,\
+         'pInfo': "x'0F100063FF4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   34: { 'name': 'QSFP_40GBASE_CR4', 'sdi': 12,\
+         'pInfo': "x'0F1000A34F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   35: { 'name': '4x10_10GBASE_CR4_HAL_M', 'sdi': 12,\
+         'pInfo': "x'0F1000936F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   36: { 'name': 'QSFP_40GBASE_CR4_1M', 'sdi': 12,\
+         'pInfo': "x'0F1000932F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   37: { 'name': 'QSFP_40GBASE_CR4_2M', 'sdi': 12,\
+         'pInfo': "x'0F1000939F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   38: { 'name': 'QSFP_40GBASE_CR4_3M', 'sdi': 12,\
+         'pInfo': "x'0F1000933F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   39: { 'name': 'QSFP_40GBASE_CR4_5M',  'sdi': 12,\
+         'pInfo': "x'0F1000934F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   40: { 'name': 'QSFP_40GBASE_CR4_7M',  'sdi': 12,\
+         'pInfo': "x'0F1000937F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   41: { 'name': 'QSFP_40GBASE_CR4_10M', 'sdi': 12,\
+         'pInfo': "x'0F1000935F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   42: { 'name': 'QSFP_40GBASE_CR4_50M', 'sdi': 12,\
+         'pInfo': "x'0F1000938F4000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   43: { 'name': '4x10_10GBASE_CR1_HAL_M', 'sdi': 12,\
+         'pInfo': "x'0F100093624000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   44: { 'name': '4x10_10GBASE_CR1_1M', 'sdi': 12,\
+         'pInfo': "x'0F100093224000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   45: { 'name': '4x10_10GBASE_CR1_3M', 'sdi': 12,\
+         'pInfo': "x'0F100093324000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   46: { 'name': '4x10_10GBASE_CR1_5M', 'sdi': 12,\
+         'pInfo': "x'0F100093424000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   47: { 'name': '4x10_10GBASE_CR1_7M', 'sdi': 12,\
+         'pInfo': "x'0F100093724000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   48: { 'name': '4X_10GBASE_SR_AOCXXM', 'sdi': 12,\
+         'pInfo': "x'0F1000A3F14000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   49: { 'name': '4x1_1000BASE_T', 'sdi': 12,\
+         'pInfo': "x'0F1000E3F24000'", 'tCode': "x'2000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+
+   # Dell Non-Qual - Type based on sdi, pInfo, tCode, and dTech
+   50: { 'name': 'QSFP_40GBASE_LR4 (nQual)', 'sdi': 12,\
+         'pInfo': "x'000000FFFF4000'", 'tCode': "x'0200000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   51: { 'name': 'QSFP_40GBASE_SR4 (nQual)', 'sdi': 12,\
+         'pInfo': "x'000000FFFF4000'", 'tCode': "x'0400000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   52: { 'name': 'QSFP_40GBASE_CR4 (nQual)', 'sdi': 12,\
+         'pInfo': "x'000000FFFF4000'", 'tCode': "x'0800000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   53: { 'name': 'QSFP_40GBASE_CR4 (nQual,psv)', 'sdi': 12,\
+         'pInfo': "x'000000FFFF4000'", 'tCode': "x'0000000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 11<<4},
+   54: { 'name': 'SFPPLUS_10GBASE_SR4 (nQual)', 'sdi': 3,\
+         'pInfo': "x'000000FFFF4000'", 'tCode': "x'0100000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   55: { 'name': 'SFPPLUS_10GBASE_LR4 (nQual)', 'sdi': 3,\
+         'pInfo': "x'000000FFFF4000'", 'tCode': "x'0200000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   56: { 'name': 'SFPPLUS_10GBASE_LRM (nQual)', 'sdi': 3,\
+         'pInfo': "x'000000FFFF4000'", 'tCode': "x'0400000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   57: { 'name': 'SFPPLUS_10GBASE_ER (nQual)', 'sdi': 3,\
+         'pInfo': "x'000000FFFF4000'", 'tCode': "x'0800000700000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+
+   58: { 'name': 'SFPPLUS_10GBASE_CU1M (nQual,psv,cLn 1)', 'sdi': 3,\
+         'pInfo': "x'00000000004000'", 'tCode': "x'0000000000100000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 1, 'dTech': 0},
+   59: { 'name': 'SFPPLUS_10GBASE_CU2M (nQual,psv,cLn 2)', 'sdi': 3,\
+         'pInfo': "x'00000000004000'", 'tCode': "x'0000000000100000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 2, 'dTech': 0},
+   60: { 'name': 'SFPPLUS_10GBASE_CU3M (nQual,psv,cLn 3)', 'sdi': 3,\
+         'pInfo': "x'00000000004000'", 'tCode': "x'0000000000100000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 3, 'dTech': 0},
+   61: { 'name': 'SFPPLUS_10GBASE_CU5M (nQual,psv,cLn 5)', 'sdi': 3,\
+         'pInfo': "x'00000000004000'", 'tCode': "x'0000000000100000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 5, 'dTech': 0},
+   62: { 'name': 'SFPPLUS_10GBASE_CU7M (nQual,act,cLn 7)', 'sdi': 3,\
+         'pInfo': "x'00000000004000'", 'tCode': "x'0000000000200000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 7, 'dTech': 0},
+   63: { 'name': 'SFPPLUS_10GBASE_CU10M (nQual,act,cLn 10)', 'sdi': 3,\
+         'pInfo': "x'00000000004000'", 'tCode': "x'0000000000200000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 10, 'dTech': 0},
+
+   # UNKNOWN - Type based on sdi, pInfo, tCode
+   64: { 'name': 'UNKNOWN (sdi 1)', 'sdi': 1,\
+         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   65: { 'name': 'UNKNOWN SFPPLUS', 'sdi': 3,\
+         'pInfo': "x'0F100000004000'", 'tCode': "x'0000000000000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+   66: { 'name': 'UNKNOWN QSFP', 'sdi': 12,\
+         'pInfo': "x'0F100000004000'", 'tCode': "x'0000000000000000'",\
+         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+
+   # The below optic types are currently not supported
+
+   # Type based on sdi, pInfo, tCode, and wlen
+#   50: { 'name': 'SFP_SX', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'",  'tCode': "x'0000000100000000'",\
+#         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   51: { 'name': 'SFP_LX (sdi 2)', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000200000000'",\
+#         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   52: { 'name': 'SFP_LX (sdi 16)', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000001000000000'",\
+#         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   53: { 'name': 'SFP_ZX (LX, wvL 1550)', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000200000000'",\
+#         'vInfo': "'599690001'", 'wlen': 1550, 'cLen': 0, 'dTech': 0},
+#   54: { 'name': 'SFP_CX', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000400000000'",\
+#         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   55: { 'name': 'SFP_T', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000800000000'",\
+#         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   56: { 'name': 'SFP_FX', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000002000000000'",\
+#         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   57: { 'name': 'SFP_BX10', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000004000000000'",\
+#         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   58: { 'name': 'SFP_PX', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000008000000000'",\
+#         'vInfo': "'599690001'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+
+   # Type based on sdi, pInfo, tCode, and vInfo
+#   59: { 'name': 'SFP_ZX (FTRJ-1519-7D-CSC)', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FTRJ-1519-7D-CSC'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   60: { 'name': 'SFP_ZX (FTLF1519P1BCL)', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FTLF1519P1BCL'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   61: { 'name': 'SFP_ZX (FTLF1519P1WCL)', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FTLF1519P1WCL'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   62: { 'name': 'SFP_CWDM (FWDM-1619-7D-47)', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FWDM-1619-7D-47'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   63: { 'name': 'SFP_CWDM (FWDM-1619-7D-49)', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FWDM-1619-7D-49'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   64: { 'name': 'SFP_CWDM (FWDM-1619-7D-51)', 'sdi': 3,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FWDM-1619-7D-51'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   65: { 'name': 'SFP_CWDM (FWDM-1619-7D-53)', 'sdi': 11,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FWDM-1619-7D-53'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   66: { 'name': 'SFP_CWDM (FWDM-1619-7D-55)', 'sdi': 11,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FWDM-1619-7D-55'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   67: { 'name': 'SFP_CWDM (FWDM-1619-7D-57)', 'sdi': 11,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FWDM-1619-7D-57'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   68: { 'name': 'SFP_CWDM (FWDM-1619-7D-59)', 'sdi': 11,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FWDM-1619-7D-59'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+#   69: { 'name': 'SFP_CWDM (FWDM-1619-7D-61)', 'sdi': 11,\
+#         'pInfo': "x'0F1000FFFF4000'", 'tCode': "x'0000000000000000'",\
+#         'vInfo': "'FWDM-1619-7D-61'", 'wlen': 64, 'cLen': 0, 'dTech': 0},
+}
+
+
+def sdiDbSqlOpen():
+   """Open the sdi sql database."""
+
+   global gSdiDbHandle
+
+   path = '%s%s' % (SDI_DB_BASE_DEFAULT, SDI_DB_NAME_DEFAULT)
+
+   # Open the db. If it doesn's exist, this call will create.
+   gSdiDbHandle = sqlite3.connect(path)
+
+
+def sdiDbSqlClose():
+   """Close the sdi sql database."""
+
+   # Close the db
+   gSdiDbHandle.close()
+
+
+def platEvtExitScript():
+   """Provide 1-step exit from the script."""
+
+   # Close sdi sql database
+   sdiDbSqlClose()
+
+   # Exit script
+   sys.exit()
+
+
+def sdiDbSqlGetAttr(table_name, attribute_name, condition):
+   """Query the sdi sql database for the attributes satisfying
+      the condition."""
+
+   # Build parameter list for sql query
+   sql = 'SELECT %s from %s' % (attribute_name, table_name)
+   if condition:
+      sql += ' where %s' % (condition)
+
+   try:
+      # Execute sql command
+      return gSdiDbHandle.execute(sql)
+
+   except sqlite3.Error as er:
+      # Print sql query and returned err message
+      print '   Error: sql ', sql
+      print '        ', er.message
+      return 0 
+
+
+def sdiDbSqlSetAttr(table_name, attribute_name, condition):
+   """Set the sdi sql database attribute satisfying the
+      condition."""
+
+   # Build parameter list for sql query
+   sql = 'UPDATE %s set %s' % (table_name, attribute_name)
+   if condition:
+      sql += ' where %s' % (condition)
+
+   try:
+      # Execute sql command
+      gSdiDbHandle.execute(sql)
+
+      # Commit change
+      gSdiDbHandle.commit()
+      return 1
+
+   except sqlite3.Error as er:
+      # Rollback on error
+      gSdiDbHandle.rollback()
+
+      # Print sql query and returned err message
+      print '   Error: sql ', sql
+      print '        ', er.message
+      return 0
+
+
+def sdiDbSqlGetMediaParamAttr(rHndl, parameter):
+   """Query the sdi Media Parameter database table for the value
+      satisfying the condition."""
+
+   # Build db query parameters
+   condition = '%s = %s and %s = %s' % (
+               TBL_RESOURCE_HDL, str(rHndl),
+               MEDIA_PARAM_TYPE, str(parameter))
+
+   query = sdiDbSqlGetAttr(TABLE_MEDIA_PARAMS, MEDIA_PARAM_VALUE, condition)
+
+   if not query:
+       print '    Error in reading rHndl %d media param %d' % (rHndl, parameter)
+       return PLAT_MEDIA_ERROR
+
+   # Get row
+   row = query.fetchone()
+   return row[0]
+
+
+def sdiDbSqlSetMediaParamAttr(rHndl, parameter, value):
+   """Set the sdi Media Param database table attribute satisfying the
+      condition."""
+
+   # Build db query parameters
+   attr = '%s = %s' % (MEDIA_PARAM_VALUE, str(value))
+   condition = '%s = %s and %s = %s' % (TBL_RESOURCE_HDL, str(rHndl),
+               MEDIA_PARAM_TYPE, str(parameter))
+
+   sdiDbSqlSetAttr(TABLE_MEDIA_PARAMS, attr, condition)
+
+
+def sdiDbSqlGetMediaVendorInfoAttr(rHndl, parameter):
+   """Query the sdi Media Vendor Info database table for the value
+      satisfying the condition."""
+
+   # Build db query parameters
+   condition = '%s = %s and %s = %s' % (TBL_RESOURCE_HDL, str(rHndl),
+               MEDIA_VENDOR_INFO_TYPE, str(parameter))
+
+   query = sdiDbSqlGetAttr(TABLE_MEDIA_VENDOR_INFO, MEDIA_VENDOR_INFO_VALUE,
+                           condition)
+
+   if not query:
+       print '    Error in reading rHndl %d media vendor info %d' %\
+             (rHndl, parameter)
+       return PLAT_MEDIA_ERROR
+
+   # Get row
+   row = query.fetchone()
+   return row[0]
+
+
+def sdiDbSqlSetMediaVendorInfoAttr(rHndl, parameter, value):
+   """Set the sdi Media Vendor Info database table attribute satisfying
+      the condition."""
+
+   # Build db query parameters
+   attr = '%s = %s' % (MEDIA_VENDOR_INFO_VALUE, str(value))
+   condition = '%s = %s and %s = %s' % (TBL_RESOURCE_HDL, str(rHndl),
+               MEDIA_VENDOR_INFO_TYPE, str(parameter))
+
+   sdiDbSqlSetAttr(TABLE_MEDIA_VENDOR_INFO, attr, condition)
+
+
+def sdiDbSqlGetMediaAttr(rHndl, parameter):
+   """Get the sdi Media database table attribute satisfying the condition."""
+
+   # Build db query parameters
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   query = sdiDbSqlGetAttr(TABLE_MEDIA, parameter, condition)
+
+   if not query:
+       print '    Error in reading rHndl %d media %s' % (rHndl, parameter)
+       return PLAT_MEDIA_ERROR
+
+   # Get row
+   row = query.fetchone()
+   return row[0]
+
+
+def platEvtDspMediaAttrBLOB(rHndl, parameter):
+   """Debug example of how to display the sdi Media database table
+      BLOB type attribute satisfying the condition."""
+
+   row = sdiDbSqlGetMediaAttr(rHndl, parameter)
+
+   # Since the sql BLOB type attribute seems to be like a string but
+   # with a length of 1, document how can print.
+
+   print str(row).encode('hex')
+
+
+def sdiDbSqlSetMediaAttr(rHndl, parameter, value):
+   """Set the sdi Media database table attribute to the value
+      satisfying the condition."""
+
+   # Build db query parameters
+   attr = '%s = %s' % (parameter, value)
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   sdiDbSqlSetAttr(TABLE_MEDIA, attr, condition)
+
+
+def platEvtBldPortTable():
+   """Query the sdi database to build the port table containing the
+      port's resource handles and the number of ports.""" 
+
+   global gPortTable
+
+   gPortTable = {}
+
+   # Build db query parameters
+   condition = '%s = %s' % (TBL_RESOURCE_TYPE,
+               str(TBL_RESOURCE_TYPE_OPTICS_MEDIA))
+
+   # Get the database table fields
+   query = sdiDbSqlGetAttr(TABLE_RESOURCES, TBL_RESOURCE_HDL, condition) 
+
+   if not query:
+      print '   Error: in building portTable'
+      return
+
+   # Count the resources
+   num = 0
+   for row in query:
+      num += 1
+      gPortTable[num] = {'rHndl': row[0]}
+
+   print '    %2d ports' % (max(gPortTable.keys()))
+
+
+def platEvtBldFanTable():
+   """Query the sdi database to build the fan table containing the
+      fanTray, its associated fan resource handles, and the number
+      of each resource."""
+
+   global gFanTrayTable
+
+   gFanTrayTable = {}
+
+   # Build db query parameters for fantray
+   attr = '%s, %s, %s' % (TBL_ENTITY_HDL, TBL_RESOURCE_HDL, INFO_NUM_FANS)
+   condition = '%s = %s' % (TBL_ENTITY_TYPE, str(TBL_INFO_TYPE_FAN_MEDIA))
+
+   # Get the database table fields
+   query = sdiDbSqlGetAttr(TABLE_INFO, attr, condition)
+
+   if not query:
+      print '   Error: in building FantrayTable'
+      return
+
+   # Count resources and build fantray table
+   num = 0
+   for row in query:
+         num += 1
+
+         # Add fantray entity resource into table
+         gFanTrayTable[num] = {'eHndl': row[0], 'rHndl': row[1], 'fNum': row[2]}
+
+         # Build db query parameters for # of fans per fantray entity resource
+         condition = '%s = %s and %s = %s' % (
+                     TBL_ENTITY_HDL, str(row[0]),
+                     TBL_RESOURCE_TYPE, str(TBL_INFO_TYPE_FAN_MEDIA))
+
+         # Get the fan resources per fantray entity resource
+         query2 = sdiDbSqlGetAttr(TABLE_RESOURCES, TBL_RESOURCE_HDL, condition)
+
+         if not query2:
+            print '   Error: in building FantrayTable Fans'
+            return
+
+         # Table entry for fantray
+         fan2 = gFanTrayTable[num]
+
+         num2 = 0
+         for row2 in query2:
+
+            # If the number of fans < total fantray fans, append fan handle
+            # to table entry
+            if num2 < row[2]:
+               num2 += 1
+               fan2['f%srHndl' % (num2)] = row2[0]
+
+         # Check whether num of fans match. Adjust max if not.
+         if num2 != gFanTrayTable[num]['fNum']:
+            print '    Warning: Num of fantray fans is %d not %d as config' % \
+                  (num2, gFanTrayTable[num]['fNum'])
+
+            gFanTrayTable[num]['fNum'] = num2
+
+   print '    %2d fantrays' % (max(gFanTrayTable.keys()))
+   for idx in gFanTrayTable.keys():
+      print '      %2d - %d fans' % (idx, gFanTrayTable[idx]['fNum'])
+
+
+def platEvtBldPsuTable():
+   """Query the sdi database to build the psu table containing the psu,
+      its associated fan resouce handle, and the number of resource."""
+
+   global gPsuTable
+
+   gPsuTable = {}
+
+   # Build db query parameters for psu
+   attr = '%s, %s, %s' % (TBL_ENTITY_HDL, TBL_RESOURCE_HDL, INFO_NUM_FANS)
+   condition = '%s = %s' % (TBL_ENTITY_TYPE, str(TBL_INFO_TYPE_PSU_MEDIA))
+
+   # Get the database table fields
+   query = sdiDbSqlGetAttr(TABLE_INFO, attr, condition)
+
+   if not query:
+      print '   Error: in building psuTable'
+      return
+
+   # Count resources and build psu table
+   num = 0
+   for row in query:
+         num += 1
+
+         # Add psu entity resource int table
+         gPsuTable[num] = {'eHndl': row[0], 'rHndl': row[1], 'fNum': row[2]}
+
+         # Build db query parameters for # of fans per psu entity resource
+         condition = '%s = %s and %s = %s' % (
+                     TBL_ENTITY_HDL, str(row[0]),
+                     TBL_RESOURCE_TYPE, str(TBL_INFO_TYPE_FAN_MEDIA))
+
+         # Get the fans per psu entity resource
+         query2 = sdiDbSqlGetAttr(TABLE_RESOURCES, TBL_RESOURCE_HDL, condition)
+
+         if not query2:
+            print '   Error: in building psuTable Fan'
+            return
+
+         # Table entry for psu
+         fan2 = gPsuTable[num]
+
+         num2 = 0
+         for row2 in query2:
+
+            # If the number of fans < total psu fans, append fan handle
+            if num2 < row[2]:
+               num2 += 1
+               fan2['f%srHndl' % (num2)] = row2[0]
+
+         # Check whether num of fans match. Adjust max if not.
+         if num2 != gPsuTable[num]['fNum']:
+            print '    Warning: Num of psu fans is %d not %d as config' % \
+                  (num2, gPsuTable[num]['fNum'])
+
+            gPsuTable[num]['fNum'] = num2
+
+
+   print '    %2d psus' % (max(gPsuTable.keys()))
+   for idx in gPsuTable.keys():
+      print '      %2d - %d fan' % (idx, gPsuTable[idx]['fNum'])
+ 
+
+def platEvtBldThermTable():
+   """Query the sdi database to build the thermal sensor table containing
+      the sensor resource handle, and the number of sensors."""
+
+   global gThermalTable
+
+   gThermalTable = {}
+
+   # Build db query parameters
+   attr = '%s, %s' % (TBL_RESOURCE_HDL, TBL_RESOURCE_ALIAS)
+   condition = '%s = %s' % (
+               TBL_RESOURCE_TYPE, str(TBL_RESOURCE_TYPE_THERM_MEDIA))
+
+   # Get the database table fields
+   query = sdiDbSqlGetAttr(TABLE_RESOURCES, attr, condition)
+
+   if not query:
+      print '   Error: in building thermTable'
+      return
+
+   # Count the resources
+   num = 0
+   for row in query:
+      num += 1
+      gThermalTable[num] = {'rHndl': row[0], 'name': row[1]}
+
+   print '    %2d thermal sensors' % (max(gThermalTable.keys()))
+
+
+def platEvtSetPortOpticsState(rHndl, state):
+   """Set the port optics state."""
+
+   # Build db query parameters
+   attr = '%s = %s' % (MEDIA_PRESENCE, str(state))
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   sdiDbSqlSetAttr(TABLE_MEDIA, attr, condition)
+
+
+def platEvtGetPortOpticsState(rHndl):
+   """Get the port optics state."""
+
+   # Build db query parameters
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   # Get db attributes
+   query = sdiDbSqlGetAttr(TABLE_MEDIA, MEDIA_PRESENCE, condition)
+
+   if not query:
+       print '    Error in reading rHndl %d optics state' % (rHndl)
+       return PLAT_MEDIA_ERROR
+
+   # Get row
+   row = query.fetchone()
+   return row[0]
+
+
+def platEvtChkPortOpticsState(port, rHndl, state):
+   """Check the port optics state."""
+
+   if (state == PLAT_MEDIA_NOT_PRESENT):
+      stateStr = 'not present'
+   else:
+      stateStr = 'present'
+
+   # Get current state
+   currState = platEvtGetPortOpticsState(rHndl)
+
+   if (currState == PLAT_MEDIA_NOT_PRESENT) or \
+      (currState == PLAT_MEDIA_PRESENT): 
+
+      if currState != state:
+         platEvtSetPortOpticsState(rHndl, state)
+      else:
+         print '   OpticsPort %d is %s' % (port, stateStr)
+
+
+def platEvtProcessOpticsState(state):
+   """Process the platform optics state event."""
+
+   if (state == PLAT_MEDIA_NOT_PRESENT):
+      cliStr = 'Rmv'
+   else:
+      cliStr = 'Pres'
+
+   while True:
+      print HELP_STRING_OPTICS_PRESENCE_EVENT % (cliStr, max(gPortTable.keys()))
+
+      cmd = raw_input('Enter OpticsPort%s ' % (cliStr))
+      if cmd in ['-q', 'q']:
+         platEvtExitScript() 
+      elif cmd in ['-e', 'e']:
+         break
+      elif cmd.isdigit() and (int(cmd) in gPortTable.keys()):
+         # All chars of string are digits and within range
+         platEvtChkPortOpticsState(int(cmd), gPortTable[int(cmd)]['rHndl'],
+                                   state)
+      else:
+         print '  Invalid OpticsPort%s %s\n' % (cliStr, cmd)
+
+
+def platEvtInsPortOptics(port, type, qMode):
+   """Insert the platform optics event."""
+
+   # Get port handle
+   rHndl = gPortTable[port]['rHndl']
+
+   # Get optics entry
+   optic = OPTICS_TABLE[type]
+
+   state = platEvtGetPortOpticsState(rHndl)
+   if state == PLAT_MEDIA_PRESENT:
+      print '   Remove OpticsPort %d, 5 sec delay' % (port)
+
+      # For ease of script use, remove optics port if present
+      platEvtSetPortOpticsState(rHndl, PLAT_MEDIA_NOT_PRESENT)
+       
+      time.sleep(5)
+
+      # Change state and continue below
+
+   elif (state == PLAT_MEDIA_ERROR) or (state != PLAT_MEDIA_NOT_PRESENT):
+      print '   Error unknown OpticsPort %d state %s' % (port, state)
+      return
+
+   # Port optics should be not present
+
+   # Check if QSFP should be overwritten as QSFP-PLUS
+   sdi = optic['sdi']
+   if (sdi == PLAT_SDI_QSFP_MODE) and (qMode == PLAT_SDI_QSFP_PLUS_MODE): 
+      sdi = qMode;
+
+   # Set the SDI Identifier to set category
+   sdiDbSqlSetMediaParamAttr(rHndl, SDI_MEDIA_IDENTIFIER, sdi)
+ 
+   # Set the Product Info
+   sdiDbSqlSetMediaAttr(rHndl, MEDIA_DELL_PROD_INFO, optic['pInfo'])
+
+#   platEvtDspMediaAttrBLOB(rHndl, MEDIA_DELL_PROD_INFO)
+
+   # Set the transceiver code
+   sdiDbSqlSetMediaAttr(rHndl, MEDIA_TRANSCEIVER_CODE, optic['tCode'])
+
+#   platEvtDspMediaAttrBLOB(rHndl, MEDIA_TRANSCEIVER_CODE)
+
+   # Set the Vendor part number
+   sdiDbSqlSetMediaVendorInfoAttr(rHndl, SDI_MEDIA_VENDOR_PN, optic['vInfo'])
+
+#   row = sdiDbSqlGetMediaVendorInfoAttr(rHndl, SDI_MEDIA_VENDOR_PN)
+#   print row
+
+   # Set the wavelength
+   sdiDbSqlSetMediaParamAttr(rHndl, SDI_MEDIA_WAVELENGTH, optic['wlen'])
+
+   # Set the cable length
+   sdiDbSqlSetMediaParamAttr(rHndl, SDI_MEDIA_LENGTH_CABLE_ASSEMBLY,
+                             optic['cLen'])
+
+#   row = sdiDbSqlGetMediaParamAttr(rHndl, SDI_MEDIA_LENGTH_CABLE_ASSEMBLY)
+#   print row
+
+   # Set the device tech
+   sdiDbSqlSetMediaParamAttr(rHndl, SDI_MEDIA_DEVICE_TECH, optic['dTech'])
+
+   # Set Optics presence
+   platEvtSetPortOpticsState(rHndl, PLAT_MEDIA_PRESENT)
+
+
+def platEvtPrintOpticsType():
+   """Display the platform optics types in columns."""
+
+   num = max(OPTICS_TABLE.keys())
+
+   # First column row should have +1 objects with odd num
+   maxrows = (num >> 1) + (num & 0x1)
+
+   # Loop through first column, +1 since start with 1
+   for idx in xrange(1, maxrows +1):
+      col = OPTICS_TABLE[idx]
+      idx2 = idx + maxrows
+
+      # If odd num, first column will be +1 objects
+      if idx2 <= num:
+         col2 = OPTICS_TABLE[idx2]
+         print '     %-2d  %-33s    %-2d  %-33s' % (idx, col['name'], idx2,
+               col2['name']) 
+      else:
+         print '     %-2d  %-33s' % (idx, col['name']) 
+   print '\n'
+
+
+def platEvtProcessOpticsInsert():
+   """Process the platform optics insert event."""
+
+   # Global to keep through session
+   global gQsfpMode
+
+   qMode = SDI_IDENT[gQsfpMode]
+
+   while True:
+      print HELP_STRING_OPTICS_INSERT_EVENT % (qMode['name'], max(gPortTable.keys()),
+            max(OPTICS_TABLE.keys()))
+
+      platEvtPrintOpticsType()
+
+      cmd = raw_input('Enter OpticsPortIns: ')
+
+      if cmd in ['-h', 'h']:
+         print HELP_STRING_OPTICS_INSERT_EVENT % (qMode['name'], max(gPortTable.keys()),
+            max(OPTICS_TABLE.keys()))
+
+         platEvtPrintOpticsType()
+
+      elif cmd in ['-q', 'q']:
+         platEvtExitScript() 
+      elif cmd in ['-e', 'e']:
+         break
+      elif cmd in ['-m', 'm']:
+         if (gQsfpMode == PLAT_SDI_QSFP_MODE):
+            gQsfpMode = PLAT_SDI_QSFP_PLUS_MODE
+         else:
+            gQsfpMode = PLAT_SDI_QSFP_MODE
+
+         qMode = SDI_IDENT[gQsfpMode]
+         print '    Change to %s mode' % (qMode['name'])
+
+      elif cmd.isdigit() and (int(cmd) in gPortTable.keys()):
+         # All chars of string are digits and within range
+
+         type = raw_input('Enter OpticsTypeIns: ')
+
+         if type.isdigit() and (int(type) in OPTICS_TABLE.keys()):
+            platEvtInsPortOptics(int(cmd), int(type), gQsfpMode)
+         else:
+            print '  Unexpected OpticsTypeIns %s' % (type)
+      else:
+         print '  Unexpected OpticsPortIns %s' % (cmd)
+
+
+def platEvtProcessOpticsEvent():
+   """Process the platform optics events."""
+
+   while True:
+      print HELP_STRING_OPTICS_EVENT
+
+      cmd = raw_input('Enter OpticsCmd: ')
+      if cmd in ['-h', 'h']:
+         print HELP_STRING_OPTICS_EVENT
+      elif cmd in ['-q', 'q']:
+         platEvtExitScript() 
+      elif cmd in ['-e', 'e']:
+         break
+      elif cmd == '1':
+         platEvtProcessOpticsInsert()
+      elif cmd == '2':
+         platEvtProcessOpticsState(PLAT_MEDIA_NOT_PRESENT)
+      elif cmd == '3':
+         platEvtProcessOpticsState(PLAT_MEDIA_PRESENT)
+      else:
+         print '  Unexpected OpticsCmd %s' % (cmd)
+
+
+def platEvtGetEntityInfoState(rHndl):
+   """Get the entity info presence state."""
+
+   # Build db query parameters
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   # Get db attributes
+   query = sdiDbSqlGetAttr(TABLE_INFO, INFO_PRESENCE, condition)
+
+   if not query:
+       print '    Error in reading media rHndl %s presence' %\
+             (str(rHndl))
+       return PLAT_MEDIA_ERROR
+
+   # Get row
+   row = query.fetchone()
+   return row[0]
+
+
+def platEvtSetEntityInfoState(rHndl, state):
+   """Set the entity info presence state."""
+
+   # Build db query parameters
+   attr = '%s = %s' % (INFO_PRESENCE, str(state))
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   sdiDbSqlSetAttr(TABLE_INFO, attr, condition)
+
+
+def platEvtSetEntityInfoStatus(rHndl, status):
+   """Set the entity info fault status."""
+
+   # Build db query parameters
+   attr = '%s = %s' % (INFO_FAULT, str(status))
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   sdiDbSqlSetAttr(TABLE_INFO, attr, condition)
+
+
+def platEvtSetMediaFanStatus(rHndl, status):
+   """Set the platform media entity fan fault status."""
+
+   # Build db query parameters
+   attr = '%s = %s' % (FAN_FAULT, str(status))
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   sdiDbSqlSetAttr(TABLE_FAN, attr, condition)
+
+
+def platEvtProcessEntityMediaFanStatus(mediaTable, mediaStr, status):
+   """Process the platform entity media fan fault status event."""
+
+   # Get the max fan for script CLI prompt
+   maxFan = mediaTable[1]['fNum']
+
+   if (status == PLAT_MEDIA_NO_FAULT):
+      cliStr = 'Clr'
+   else:
+      cliStr = 'Ins'
+
+   while True:
+      print HELP_STRING_MEDIA_FAN_FAULT_EVENT % (mediaStr, cliStr, mediaStr,
+            max(mediaTable.keys()), maxFan)
+
+      cmd = raw_input('Enter %sFanFlt%s: ' % (mediaStr, cliStr))
+      if cmd in ['-q', 'q']:
+         platEvtExitScript()
+      elif cmd in ['-e', 'e']:
+         break
+      elif cmd.isdigit() and (int(cmd) in mediaTable.keys()):
+         # All chars of string are digits and within range
+
+         mediaEntry = mediaTable[int(cmd)]
+
+         # Get current media state
+         state = platEvtGetEntityInfoState(mediaEntry['rHndl'])
+         if state == PLAT_MEDIA_PRESENT:
+
+            fan = raw_input('Enter %sFanFlt%sFan: ' % (mediaStr, cliStr))
+            if fan.isdigit() and (int(fan) in xrange (1, mediaEntry['fNum'] + 1)):
+               platEvtSetMediaFanStatus(mediaEntry['f%srHndl' % int(fan)],
+                                        state)
+            else:
+               print '  Unexpected %sFanFlt%sFan %s' % (mediaStr, cliStr, fan)
+
+         elif state == PLAT_MEDIA_NOT_PRESENT:
+            print '    Error %s %s not present' % (mediaStr, cmd)
+         else:
+            print '    Error in reading %s %s state %s' % (mediaStr, cmd, state)
+      else:
+         print '  Unexpected %s %s\n' % (mediaStr, cmd)
+
+
+def platEvtProcessEntityMediaFault(mediaTable, mediaStr, status):
+   """Process the platform entity media fault event."""
+
+   if (status == PLAT_MEDIA_NO_FAULT):
+      cliStr = 'Clr'
+   else:
+      cliStr = 'Ins'
+
+   while True:
+      print HELP_STRING_MEDIA_FAULT_EVENT % (mediaStr, cliStr, mediaStr,
+            max(mediaTable.keys()))
+
+      cmd = raw_input('Enter %sFlt%s: ' % (mediaStr, cliStr))
+      if cmd in ['-q', 'q']:
+         platEvtExitScript()
+      elif cmd in ['-e', 'e']:
+         break
+      elif cmd.isdigit() and (int(cmd) in mediaTable.keys()):
+         # All chars of string are digits and within range
+
+         rHndl = mediaTable[int(cmd)]['rHndl']
+
+         state = platEvtGetEntityInfoState(rHndl)
+         if state == PLAT_MEDIA_PRESENT:
+            platEvtSetEntityInfoStatus(rHndl, status)
+         elif state == PLAT_MEDIA_NOT_PRESENT:
+            print '    Error %s %s not present' % (mediaStr, cmd)
+         else: 
+            print '    Error in reading %s %s state %d' % (mediaStr, cmd, state)
+      else:
+         print '  Unexpected %sFlt%s %s\n' % (mediaStr, cliStr, cmd)
+
+
+def platEvtProcessEntityMediaState(mediaTable, mediaStr, state):
+   """Process the platform entity info media state."""
+
+   if (state == PLAT_MEDIA_NOT_PRESENT):
+      cliStr = 'Rmv'
+   else:
+      cliStr = 'Ins'
+
+   while True:
+      print HELP_STRING_MEDIA_STATE_EVENT % (mediaStr, cliStr, mediaStr,
+            max(mediaTable.keys()))
+
+      cmd = raw_input('Enter %s%s: ' % (mediaStr, cliStr))
+      if cmd in ['-q', 'q']:
+         platEvtExitScript()
+      elif cmd in ['-e', 'e']:
+         break
+      elif cmd.isdigit() and (int(cmd) in mediaTable.keys()):
+         # All chars of string are digits and within range
+
+         rHndl = mediaTable[int(cmd)]['rHndl']
+
+         # Get current state of entity media
+         currState = platEvtGetEntityInfoState(rHndl)
+         if (currState == PLAT_MEDIA_PRESENT) or \
+            (currState == PLAT_MEDIA_NOT_PRESENT):
+
+            if (currState != state):
+               platEvtSetEntityInfoState(rHndl, state)
+            else:
+               print '   %s %s already %s' % (mediaStr, cmd, cliStr)
+
+         else:
+            print '    Error in reading %s %s state %d' % (mediaStr, cmd, state)
+      else:
+         print '  Unexpected %s%s %s\n' % (mediaStr, cliStr, cmd)
+
+
+def platEvtProcessEntityMediaEvent(mediaTable, mediaStr):
+   """Process the platform entity info media events."""
+
+   while True:
+      print HELP_STRING_MEDIA_EVENT % (mediaStr, mediaStr, mediaStr, mediaStr,
+            mediaStr, mediaStr, mediaStr)
+
+      cmd = raw_input('Enter %sCmd: ' % (mediaStr))
+      if cmd in ['-h', 'h']:
+         print HELP_STRING_MEDIA_EVENT % (mediaStr, mediaStr, mediaStr,
+               mediaStr, mediaStr, mediaStr, mediaStr)
+      elif cmd in ['-q', 'q']:
+         platEvtExitScript() 
+      elif cmd in ['-e', 'e']:
+         break
+      elif cmd == '1':
+         platEvtProcessEntityMediaState(mediaTable, mediaStr,
+                                        PLAT_MEDIA_PRESENT)
+      elif cmd == '2':
+         platEvtProcessEntityMediaState(mediaTable, mediaStr,
+                                        PLAT_MEDIA_NOT_PRESENT)
+      elif cmd == '3':
+         platEvtProcessEntityMediaFault(mediaTable, mediaStr,
+                                         PLAT_MEDIA_FAULT)
+      elif cmd == '4':
+         platEvtProcessEntityMediaFault(mediaTable, mediaStr,
+                                         PLAT_MEDIA_NO_FAULT)
+      elif cmd == '5':
+         platEvtProcessEntityMediaFanStatus(mediaTable, mediaStr,
+                                            PLAT_MEDIA_FAULT)
+      elif cmd == '6':
+         platEvtProcessEntityMediaFanStatus(mediaTable, mediaStr,
+                                            PLAT_MEDIA_NO_FAULT)
+      else:
+         print '  Unexpected %sCmd %s' % (mediaStr, cmd)
+
+
+def platEvtGetThermalThresh(rHndl):
+   """Get the thermal threholds."""
+
+   # Build db query parameters
+   attr = '%s, %s, %s' % (THERMAL_THRESHOLD_LOW, THERMAL_THRESHOLD_HIGH,
+          THERMAL_THRESHOLD_CRITICAL)
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   # Get db attributes
+   query = sdiDbSqlGetAttr(TABLE_THERMAL_SENSOR, attr, condition)
+
+   if not query:
+       print '    Error in reading therm rHndl %s thresholds' %\
+             (str(rHndl))
+       return PLAT_MEDIA_ERROR
+
+   # Get row
+   return query.fetchone()
+
+
+def platEvtSetThermalTemp(rHndl, status):
+   """Set the thermal sensor temperature."""
+
+   # Build db query parameters
+   attr = '%s = %s' % (THERMAL_TEMPERATURE, str(status))
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   sdiDbSqlSetAttr(TABLE_THERMAL_SENSOR, attr, condition)
+
+
+def platEvtGetThermalTemp(rHndl):
+   """Get the thermal temperature."""
+
+   # Build db query parameters
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   # Get db attributes
+   query = sdiDbSqlGetAttr(TABLE_THERMAL_SENSOR, THERMAL_TEMPERATURE, condition)
+
+   if not query:
+       print '    Error in reading therm rHndl %s temp' % (str(rHndl))
+       return PLAT_MEDIA_ERROR
+
+   # Get row
+   row = query.fetchone()
+   return row[0]
+
+
+def platEvtListThermalSensors():
+   """List the thermal sensors, temperature, and thresholds."""
+
+   print '\n'
+   for idx in gThermalTable.keys():
+      thermal = gThermalTable[idx]
+      temp = platEvtGetThermalTemp(thermal['rHndl'])
+      thresh = platEvtGetThermalThresh(thermal['rHndl'])
+
+      if (thresh[0] != PLAT_MEDIA_ERROR) and (thresh[1] != PLAT_MEDIA_ERROR) and\
+         (thresh[2] != PLAT_MEDIA_ERROR) and (temp != PLAT_MEDIA_ERROR):
+         print '     %d   %-25s  %3s    (low %s, hi %s, crt %s)' %\
+               (idx, thermal['name'], temp, thresh[0], thresh[1], thresh[2])
+      else:
+         print '    Error in reading temp or thresholds %d %s' %\
+               (idx, thermal['name'])
+ 
+   print '\n'
+
+
+def platEvtSetThermalStatus(rHndl, status):
+   """Set the thermal sensor fault status."""
+
+   # Build db query parameters
+   attr = '%s = %s' % (THERMAL_FAULT, str(status))
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   sdiDbSqlSetAttr(TABLE_THERMAL_SENSOR, attr, condition)
+
+
+def platEvtGetThermalStatus(rHndl):
+   """Get the thermal sensor fault status."""
+
+   # Build db query parameters
+   condition = '%s = %s' % (TBL_RESOURCE_HDL, str(rHndl))
+
+   # Get db attributes
+   query = sdiDbSqlGetAttr(TABLE_THERMAL_SENSOR, THERMAL_FAULT, condition)
+
+   if not query:
+       print '    Error in reading therm rHndl %s status' % (str(rHndl))
+       return PLAT_MEDIA_ERROR
+
+   # Get row
+   row = query.fetchone()
+   return row[0]
+
+
+def platEvtProcessThermalFault(status):
+   """Process the platform thermal sensor fault event."""
+
+   if (status == PLAT_MEDIA_NO_FAULT):
+      cliStr = 'Clr'
+   else:
+      cliStr = 'Ins'
+
+   while True:
+      print HELP_STRING_THERMAL_FAULT_EVENT % (cliStr, max(gThermalTable.keys()))
+      for idx in gThermalTable.keys():
+         print '          %d = %s' % (idx, gThermalTable[idx]['name'])
+      print '\n'
+
+      cmd = raw_input('Enter ThermalFlt%s: ' % (cliStr))
+      if cmd in ['-q', 'q']:
+         platEvtExitScript()
+      elif cmd in ['-e', 'e']:
+         break
+      elif cmd.isdigit() and (int(cmd) in gThermalTable.keys()):
+         # All chars of string are digits and within range
+
+         rHndl = gThermalTable[int(cmd)]['rHndl']
+
+         platEvtSetThermalStatus(rHndl, status)
+
+#         print platEvtGetThermalStatus(rHndl)
+
+      else:
+         print '  Unexpected ThermalFlt%s %s\n' % (cliStr, cmd)
+
+
+def platEvtProcessThermalTemp():
+   """Process the platform thermal temperature event."""
+
+   while True:
+      print HELP_STRING_THERMAL_TEMP_EVENT % (max(gThermalTable.keys()),
+            PLAT_THERMAL_MIN_TEMP, PLAT_THERMAL_MAX_TEMP)
+
+      # List sensors & current temps
+      platEvtListThermalSensors()
+
+      cmd = raw_input('Enter ThermalSensor: ')
+      if cmd in ['-q', 'q']:
+         platEvtExitScript()
+      elif cmd in ['-e', 'e']:
+         break
+      elif cmd.isdigit() and (int(cmd) in gThermalTable.keys()):
+         # All chars of string are digits and within range
+
+         temp  = raw_input('Enter ThermalTemp: ')
+         if temp.isdigit() and (int(temp) in xrange(PLAT_THERMAL_MIN_TEMP,
+            PLAT_THERMAL_MAX_TEMP + 1)):
+
+            platEvtSetThermalTemp(gThermalTable[int(cmd)]['rHndl'], temp)
+         else:
+            print '  Unexpected ThermalTemp %s\n' % (temp)
+      else:
+         print '  Unexpected ThermalSensor %s\n' % (cmd)
+
+
+def platEvtProcessThermalEvent():
+   """Process the platform thermal sensor events."""
+
+   while True:
+      print HELP_STRING_THERMAL_EVENT
+
+      cmd = raw_input('Enter ThermalCmd: ')
+      if cmd in ['-h', 'h']:
+         print HELP_STRING_MEDIA_EVENT
+      elif cmd in ['-q', 'q']:
+         platEvtExitScript()
+      elif cmd in ['-e', 'e']:
+         break
+      elif cmd == '1':
+         platEvtProcessThermalFault(PLAT_MEDIA_FAULT)
+      elif cmd == '2':
+         platEvtProcessThermalFault(PLAT_MEDIA_NO_FAULT)
+      elif cmd == '3':
+         platEvtProcessThermalTemp()
+      elif cmd == '4':
+         platEvtListThermalSensors()
+      else:
+         print '  Unexpected ThermalCmd %s' % (cmd)
+
+
+if __name__ == '__main__':
+
+   # Must be root to update sql vm db
+   if os.geteuid() != 0:
+      sys.exit('\n    Error must be root to update VM database\n')
+
+   sdiDbSqlOpen()
+
+   print '\n  Media:'
+
+   # Build tables of resource handles
+   platEvtBldPortTable()
+   platEvtBldFanTable()
+   platEvtBldPsuTable()
+   platEvtBldThermTable()
+   print '\n'
+
+   gQsfpMode = PLAT_SDI_QSFP_PLUS_MODE
+
+   while True:
+      print HELP_STRING_PLATFORM_EVENT
+
+      cmd = raw_input('Enter PlatCmd: ')
+      if cmd in ['-h', 'h']:
+         print HELP_STRING_PLATFORM_EVENT
+      elif cmd in ['-q', 'q']:
+         break;
+      elif cmd == '1':
+         platEvtProcessOpticsEvent()
+      elif cmd == '2':
+         platEvtProcessEntityMediaEvent(gFanTrayTable, PLAT_MEDIA_FANTRAY_STR)
+      elif cmd == '3':
+         platEvtProcessEntityMediaEvent(gPsuTable, PLAT_MEDIA_PSU_STR)
+      elif cmd == '4':
+         platEvtProcessThermalEvent()
+      else:
+         print '  Unexpected PlatCmd %s' % (cmd)
+
+   sdiDbSqlClose()
+
