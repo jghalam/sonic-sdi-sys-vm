@@ -3,7 +3,7 @@ Section: net
 Priority: optional
 Maintainer: Dell <support@dell.com>
 Build-Depends: debhelper (>= 9), dh-autoreconf, sonic-sdi-api-dev,
- libsonic-logging-dev
+ libsonic-logging-dev, libsonic-db-sql-dev
 Standards-Version: 3.9.3
 Vcs-Browser: https://github.com/Azure/sonic-sdi-sys-vm
 Vcs-Git: https://github.com/Azure/sonic-sdi-sys-vm.git
